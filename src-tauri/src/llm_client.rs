@@ -4,20 +4,20 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFER
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ChatMessage {
     role: String,
     content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct JsonSchema {
     name: String,
     strict: bool,
     schema: Value,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 struct ResponseFormat {
     #[serde(rename = "type")]
     format_type: String,
@@ -57,6 +57,53 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatMessageResponse {
     content: Option<String>,
+}
+
+/// Detect whether a 400 error body is caused by the reasoning-control parameters.
+///
+/// Handy disables reasoning by default (`reasoning_effort: "none"` for custom
+/// endpoints, `reasoning: { effort: "none", exclude: true }` for OpenRouter) to
+/// cut post-processing latency. Some OpenAI-compatible endpoints reject that:
+///   - OpenRouter GPT-OSS: "Reasoning is mandatory for this endpoint and cannot be disabled."
+///   - DeepSeek: "reasoning_effort: unknown variant `none`, expected one of ..."
+/// Both mention "reasoning", so we can retry with a valid setting instead of failing.
+fn is_reasoning_error(body: &str) -> bool {
+    body.to_lowercase().contains("reasoning")
+}
+
+/// Given the current reasoning parameters, produce the next (less aggressive)
+/// variant to retry with, or `None` once there is nothing left to degrade.
+///
+/// Ladder: disabled ("none") -> minimal ("low", fastest that keeps reasoning on)
+/// -> omitted entirely (let the endpoint use its default).
+fn degrade_reasoning(
+    reasoning_effort: Option<String>,
+    reasoning: Option<ReasoningConfig>,
+) -> Option<(Option<String>, Option<ReasoningConfig>)> {
+    // Custom-style top-level field currently set to "none" -> retry with "low".
+    if reasoning_effort.as_deref() == Some("none") {
+        return Some((Some("low".to_string()), reasoning));
+    }
+
+    // OpenRouter-style nested object currently set to "none" -> retry with "low",
+    // preserving `exclude` so reasoning tokens stay out of the structured response.
+    if reasoning.as_ref().and_then(|r| r.effort.as_deref()) == Some("none") {
+        let exclude = reasoning.and_then(|r| r.exclude);
+        return Some((
+            None,
+            Some(ReasoningConfig {
+                effort: Some("low".to_string()),
+                exclude,
+            }),
+        ));
+    }
+
+    // Any other non-default value already tried -> drop reasoning params entirely.
+    if reasoning_effort.is_some() || reasoning.is_some() {
+        return Some((None, None));
+    }
+
+    None
 }
 
 /// Build headers for API requests based on provider type
@@ -179,42 +226,64 @@ pub async fn send_chat_completion_with_schema(
         },
     });
 
-    let request_body = ChatCompletionRequest {
-        model: model.to_string(),
-        messages,
-        response_format,
-        reasoning_effort,
-        reasoning,
-    };
+    // Retry loop: if the endpoint rejects the reasoning-control parameters with a
+    // 400, degrade them (none -> low -> omitted) and retry instead of failing.
+    let mut cur_reasoning_effort = reasoning_effort;
+    let mut cur_reasoning = reasoning;
 
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("HTTP request failed: {}", e))?;
+    loop {
+        let request_body = ChatCompletionRequest {
+            model: model.to_string(),
+            messages: messages.clone(),
+            response_format: response_format.clone(),
+            reasoning_effort: cur_reasoning_effort.clone(),
+            reasoning: cur_reasoning.clone(),
+        };
 
-    let status = response.status();
-    if !status.is_success() {
+        let response = client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| format!("HTTP request failed: {}", e))?;
+
+        let status = response.status();
+        if status.is_success() {
+            let completion: ChatCompletionResponse = response
+                .json()
+                .await
+                .map_err(|e| format!("Failed to parse API response: {}", e))?;
+
+            return Ok(completion
+                .choices
+                .first()
+                .and_then(|choice| choice.message.content.clone()));
+        }
+
         let error_text = response
             .text()
             .await
             .unwrap_or_else(|_| "Failed to read error response".to_string());
+
+        if status.as_u16() == 400 && is_reasoning_error(&error_text) {
+            if let Some((next_effort, next_reasoning)) =
+                degrade_reasoning(cur_reasoning_effort.clone(), cur_reasoning.clone())
+            {
+                debug!(
+                    "Endpoint rejected reasoning params (400); retrying with degraded reasoning: reasoning_effort={:?}, reasoning={:?}",
+                    next_effort, next_reasoning
+                );
+                cur_reasoning_effort = next_effort;
+                cur_reasoning = next_reasoning;
+                continue;
+            }
+        }
+
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
         ));
     }
-
-    let completion: ChatCompletionResponse = response
-        .json()
-        .await
-        .map_err(|e| format!("Failed to parse API response: {}", e))?;
-
-    Ok(completion
-        .choices
-        .first()
-        .and_then(|choice| choice.message.content.clone()))
 }
 
 /// Fetch available models from an OpenAI-compatible API
